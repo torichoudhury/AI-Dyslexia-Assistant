@@ -1,6 +1,6 @@
 {
   "manifest_version": 3,
-  "name": "AI Dyslexia Assistant",
+  "name": "ReadAble",
   "version": "0.1.0",
   "description": "AI-powered tool to simplify text and make reading easier for people with dyslexia",
   "action": {

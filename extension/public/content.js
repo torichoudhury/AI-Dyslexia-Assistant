@@ -1,9 +1,21 @@
 // This script runs in the context of web pages
 
+// Default settings
+const DEFAULT_SETTINGS = {
+  theme: 'light',
+  backgroundColor: '#f8f9fa',
+  textColor: '#212529',
+  fontFamily: 'OpenDyslexic',
+  fontSize: 16,
+  lineSpacing: 1.5,
+  autoSimplify: false,
+  showSimplifyButton: true
+};
+
 // Create a floating button for text selection
 function createFloatingButton() {
   const button = document.createElement('button');
-  button.id = 'dyslexia-assistant-button';
+  button.id = 'readable-button';
   button.textContent = 'Simplify';
   button.style.position = 'absolute';
   button.style.display = 'none';
@@ -45,7 +57,7 @@ function showButtonNearSelection() {
         return;
       }
       
-      const button = document.getElementById('dyslexia-assistant-button') || createFloatingButton();
+      const button = document.getElementById('readable-button') || createFloatingButton();
       const range = selection.getRangeAt(0);
       const rect = range.getBoundingClientRect();
       
@@ -58,7 +70,7 @@ function showButtonNearSelection() {
 
 // Hide the floating button
 function hideButton() {
-  const button = document.getElementById('dyslexia-assistant-button');
+  const button = document.getElementById('readable-button');
   if (button) {
     button.style.display = 'none';
   }
@@ -104,7 +116,7 @@ function replaceSelectedText(simplifiedText, selection) {
   
   // Create a span element to hold the simplified text
   const span = document.createElement('span');
-  span.className = 'dyslexia-simplified-text';
+  span.className = 'readable-simplified-text';
   span.textContent = simplifiedText;
   
   // Apply user's font preferences
@@ -129,110 +141,219 @@ function replaceSelectedText(simplifiedText, selection) {
   });
 }
 
-// Simplify complex words on the page
-function simplifyComplexWordsOnPage() {
-  // Get all text nodes in the document
-  const textNodes = [];
-  const walker = document.createTreeWalker(
-    document.body,
-    NodeFilter.SHOW_TEXT,
-    {
-      acceptNode: function(node) {
-        // Skip script and style elements
-        if (node.parentNode.tagName === 'SCRIPT' || 
-            node.parentNode.tagName === 'STYLE' || 
-            node.parentNode.tagName === 'NOSCRIPT' ||
-            node.parentNode.className === 'dyslexia-simplified-text') {
-          return NodeFilter.FILTER_REJECT;
-        }
-        // Accept non-empty text nodes
-        return node.textContent.trim() ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT;
-      }
+// Reset page to default state
+function resetPage() {
+  // Remove all simplified text spans
+  const simplifiedTexts = document.querySelectorAll('.readable-simplified-text');
+  simplifiedTexts.forEach(span => {
+    const text = document.createTextNode(span.getAttribute('title').replace('Original: ', ''));
+    span.parentNode.replaceChild(text, span);
+  });
+
+  // Remove custom styles
+  let styleEl = document.getElementById('readable-styles');
+  if (styleEl) {
+    styleEl.remove();
+  }
+
+  // Reset to default styles
+  applyGlobalStyles(DEFAULT_SETTINGS);
+}
+
+// Apply global styles to the page
+function applyGlobalStyles(settings = null) {
+  chrome.storage.sync.get(['fontFamily', 'fontSize', 'lineSpacing', 'theme', 'backgroundColor', 'textColor'], (result) => {
+    const styles = settings || result;
+    
+    // Create or update the style element
+    let styleEl = document.getElementById('readable-styles');
+    if (!styleEl) {
+      styleEl = document.createElement('style');
+      styleEl.id = 'readable-styles';
+      document.head.appendChild(styleEl);
     }
+    
+    // Build CSS rules
+    let cssRules = '';
+    
+    // Apply font settings if specified
+    if (styles.fontFamily || styles.fontSize || styles.lineSpacing) {
+      cssRules += `
+        body, p, h1, h2, h3, h4, h5, h6, span, div, li, a, button, input, textarea, select, label {
+          ${styles.fontFamily ? `font-family: ${styles.fontFamily} !important;` : ''}
+          ${styles.fontSize ? `font-size: ${styles.fontSize}px !important;` : ''}
+          ${styles.lineSpacing ? `line-height: ${styles.lineSpacing} !important;` : ''}
+        }
+      `;
+    }
+    
+    // Apply dark mode if enabled
+    if (styles.theme === 'dark') {
+      cssRules += `
+        html, body {
+          background-color: ${styles.backgroundColor || '#121212'} !important;
+          color: ${styles.textColor || '#e0e0e0'} !important;
+        }
+        p, h1, h2, h3, h4, h5, h6, span, div, li, a, button, input, textarea, select, label {
+          color: ${styles.textColor || '#e0e0e0'} !important;
+        }
+        a {
+          color: #4299e1 !important;
+        }
+      `;
+    }
+    
+    // Update the style element content
+    styleEl.textContent = cssRules;
+  });
+}
+
+// Find the main content area of the page
+function findMainContent() {
+  // Common selectors for main content areas
+  const mainSelectors = [
+    'main',
+    'article',
+    '[role="main"]',
+    '#main-content',
+    '#content',
+    '.main-content',
+    '.content',
+    '.post-content',
+    '.article-content',
+    '.entry-content',
+    '#primary',
+    '.primary'
+  ];
+
+  // Try to find the main content element
+  for (const selector of mainSelectors) {
+    const element = document.querySelector(selector);
+    if (element) {
+      return element;
+    }
+  }
+
+  // Fallback: Find the element with the most text content
+  const textBlocks = Array.from(document.querySelectorAll('div, section, article'))
+    .filter(el => {
+      // Filter out navigation, header, footer, and sidebar elements
+      const excludeSelectors = ['nav', 'header', 'footer', 'sidebar', 'menu', 'banner'];
+      const role = el.getAttribute('role')?.toLowerCase() || '';
+      const className = el.className.toLowerCase();
+      const id = el.id.toLowerCase();
+      
+      return !excludeSelectors.some(selector => 
+        role.includes(selector) || 
+        className.includes(selector) || 
+        id.includes(selector)
+      );
+    })
+    .map(el => ({
+      element: el,
+      textLength: el.textContent.trim().length
+    }))
+    .sort((a, b) => b.textLength - a.textLength);
+
+  return textBlocks[0]?.element || document.body;
+}
+
+// Simplify all text on the page
+async function simplifyComplexWordsOnPage() {
+  const mainContent = findMainContent();
+  
+  // Get all text-containing elements within the main content
+  const textElements = mainContent.querySelectorAll(
+    'p, h1, h2, h3, h4, h5, h6, li, td, th, figcaption, blockquote, pre, code, ' +
+    'div:not(:has(*)), span:not(:has(*)), label, a'
   );
   
-  while (walker.nextNode()) {
-    textNodes.push(walker.currentNode);
-  }
+  let processedCount = 0;
+  const totalElements = textElements.length;
+  const simplifyButton = document.getElementById('readable-simplify-all');
   
-  // Process text nodes in batches to avoid overwhelming the API
-  const batchSize = 5;
-  for (let i = 0; i < textNodes.length; i += batchSize) {
-    const batch = textNodes.slice(i, i + batchSize);
-    processBatchOfTextNodes(batch);
-  }
-}
-
-// Process a batch of text nodes
-async function processBatchOfTextNodes(textNodes) {
-  // Prepare text for each node
-  const nodeTexts = textNodes.map(node => node.textContent);
-  
-  try {
-    // Send batch of texts to backend for simplification
-    const response = await fetch('http://localhost:5000/simplify', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ text: nodeTexts.join('\n\n---\n\n') }),
-    });
-    
-    const data = await response.json();
-    
-    if (data.simplified_text) {
-      // Split the simplified text back into separate parts
-      const simplifiedTexts = data.simplified_text.split('\n\n---\n\n');
-      
-      // Replace each text node with its simplified version
-      textNodes.forEach((node, index) => {
-        if (index < simplifiedTexts.length) {
-          replaceTextNodeWithSimplified(node, simplifiedTexts[index], nodeTexts[index]);
-        }
-      });
-    } else if (data.error) {
-      console.error('Error simplifying text batch:', data.error);
+  for (const element of textElements) {
+    // Skip if already simplified, empty, or contains only whitespace/special characters
+    if (
+      element.classList.contains('readable-simplified-text') || 
+      !element.textContent.trim() ||
+      !/[a-zA-Z]{2,}/.test(element.textContent) // Skip if no word-like content
+    ) {
+      continue;
     }
-  } catch (error) {
-    console.error('Error simplifying text batch:', error);
+
+    try {
+      const response = await fetch('http://localhost:5000/simplify', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ text: element.textContent }),
+      });
+
+      const data = await response.json();
+      if (data.simplified_text) {
+        const originalText = element.textContent;
+        
+        // Create wrapper span
+        const span = document.createElement('span');
+        span.className = 'readable-simplified-text';
+        span.textContent = data.simplified_text;
+        span.title = `Original: ${originalText}`;
+        
+        // Apply styles
+        span.style.backgroundColor = '#e6f7ff';
+        span.style.borderRadius = '2px';
+        span.style.padding = '0 2px';
+        
+        // Apply current font settings
+        chrome.storage.sync.get(['fontFamily', 'fontSize'], (result) => {
+          if (result.fontFamily) span.style.fontFamily = result.fontFamily;
+          if (result.fontSize) span.style.fontSize = `${result.fontSize}px`;
+        });
+
+        // Replace content
+        element.textContent = '';
+        element.appendChild(span);
+        
+        // Update progress
+        processedCount++;
+        if (simplifyButton) {
+          simplifyButton.textContent = `Simplifying... (${Math.round((processedCount / totalElements) * 100)}%)`;
+        }
+      }
+    } catch (error) {
+      console.error('Error simplifying text:', error);
+    }
+    
+    // Add a small delay between requests to avoid overwhelming the server
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+  
+  // Reset button text
+  if (simplifyButton) {
+    simplifyButton.textContent = 'Simplify All Text';
+    simplifyButton.disabled = false;
   }
 }
 
-// Replace a text node with simplified text
-function replaceTextNodeWithSimplified(textNode, simplifiedText, originalText) {
-  // Skip if the text is already simplified or hasn't changed
-  if (simplifiedText === originalText || 
-      textNode.parentNode.className === 'dyslexia-simplified-text') {
-    return;
-  }
+// Initialize the extension
+function initializeExtension() {
+  // Create the simplify all button
+  createSimplifyAllButton();
   
-  // Create a span element to hold the simplified text
-  const span = document.createElement('span');
-  span.className = 'dyslexia-simplified-text';
-  span.textContent = simplifiedText;
+  // Apply global styles
+  applyGlobalStyles();
   
-  // Apply user's font preferences
-  chrome.storage.sync.get(['fontFamily', 'fontSize'], (result) => {
-    if (result.fontFamily) span.style.fontFamily = result.fontFamily;
-    if (result.fontSize) span.style.fontSize = `${result.fontSize}px`;
-    
-    // Add a subtle highlight to indicate simplified text
-    span.style.backgroundColor = '#e6f7ff';
-    span.style.borderRadius = '2px';
-    span.style.padding = '0 2px';
-    
-    // Add tooltip to show original text
-    span.title = `Original: ${originalText}`;
-    
-    // Replace the text node with the span
-    textNode.parentNode.replaceChild(span, textNode);
-  });
+  // Listen for text selection
+  document.addEventListener('mouseup', showButtonNearSelection);
+  document.addEventListener('keyup', showButtonNearSelection);
 }
 
 // Add a button to simplify all text on the page
 function createSimplifyAllButton() {
   const button = document.createElement('button');
-  button.id = 'dyslexia-assistant-simplify-all';
+  button.id = 'readable-simplify-all';
   button.textContent = 'Simplify All Text';
   button.style.position = 'fixed';
   button.style.bottom = '20px';
@@ -250,90 +371,11 @@ function createSimplifyAllButton() {
   button.addEventListener('click', () => {
     button.textContent = 'Simplifying...';
     button.disabled = true;
-    
-    // Simplify all complex words on the page
     simplifyComplexWordsOnPage();
-    
-    setTimeout(() => {
-      button.textContent = 'Simplify All Text';
-      button.disabled = false;
-    }, 5000);
   });
   
   document.body.appendChild(button);
   return button;
-}
-
-// Apply global styles to the page
-function applyGlobalStyles() {
-  chrome.storage.sync.get(['fontFamily', 'fontSize', 'lineSpacing', 'theme', 'backgroundColor', 'textColor'], (result) => {
-    // Create or update the style element
-    let styleEl = document.getElementById('dyslexia-assistant-styles');
-    if (!styleEl) {
-      styleEl = document.createElement('style');
-      styleEl.id = 'dyslexia-assistant-styles';
-      document.head.appendChild(styleEl);
-    }
-    
-    // Build CSS rules
-    let cssRules = '';
-    
-    // Apply font settings if specified
-    if (result.fontFamily || result.fontSize || result.lineSpacing) {
-      cssRules += `
-        body, p, h1, h2, h3, h4, h5, h6, span, div, li, a, button, input, textarea, select, label {
-          ${result.fontFamily ? `font-family: ${result.fontFamily} !important;` : ''}
-          ${result.fontSize ? `font-size: ${result.fontSize}px !important;` : ''}
-          ${result.lineSpacing ? `line-height: ${result.lineSpacing} !important;` : ''}
-        }
-      `;
-    }
-    
-    // Apply dark mode if enabled
-    if (result.theme === 'dark') {
-      cssRules += `
-        html, body {
-          background-color: ${result.backgroundColor || '#121212'} !important;
-          color: ${result.textColor || '#e0e0e0'} !important;
-        }
-        p, h1, h2, h3, h4, h5, h6, span, div, li, a, button, input, textarea, select, label {
-          color: ${result.textColor || '#e0e0e0'} !important;
-        }
-        a {
-          color: #4299e1 !important;
-        }
-      `;
-    }
-    
-    // Update the style element content
-    styleEl.textContent = cssRules;
-    
-    // Log to console for debugging
-    console.log('Dyslexia Assistant: Applied global styles', {
-      fontFamily: result.fontFamily,
-      fontSize: result.fontSize,
-      lineSpacing: result.lineSpacing,
-      theme: result.theme,
-      backgroundColor: result.backgroundColor,
-      textColor: result.textColor
-    });
-  });
-}
-
-// Initialize the extension
-function initializeExtension() {
-  // Create the simplify all button
-  createSimplifyAllButton();
-  
-  // Apply global styles
-  applyGlobalStyles();
-  
-  // Listen for text selection
-  document.addEventListener('mouseup', showButtonNearSelection);
-  document.addEventListener('keyup', showButtonNearSelection);
-  
-  // Log initialization
-  console.log('Dyslexia Assistant: Content script initialized');
 }
 
 // Wait for the page to fully load
@@ -346,25 +388,16 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   } else if (request.action === 'simplifyAllText') {
     simplifyComplexWordsOnPage();
   } else if (request.action === 'updateSettings') {
-    console.log('Dyslexia Assistant: Received settings update', request.settings);
-    
-    // Update global styles
-    applyGlobalStyles();
-    
-    // Update any active tooltips with new styles
-    const simplifiedElements = document.querySelectorAll('.dyslexia-simplified-text');
-    if (simplifiedElements.length > 0 && request.settings) {
-      simplifiedElements.forEach(element => {
-        if (request.settings.fontFamily) element.style.fontFamily = request.settings.fontFamily;
-        if (request.settings.fontSize) element.style.fontSize = `${request.settings.fontSize}px`;
-      });
-    }
+    console.log('ReadAble: Received settings update', request.settings);
+    applyGlobalStyles(request.settings);
+  } else if (request.action === 'resetPage') {
+    resetPage();
   }
 });
 
 // Sync settings with extension storage
 chrome.storage.onChanged.addListener((changes) => {
-  console.log('Dyslexia Assistant: Storage changes detected', changes);
+  console.log('ReadAble: Storage changes detected', changes);
   
   // Update global styles when settings change
   if (changes.theme || changes.fontFamily || changes.fontSize || 
@@ -376,7 +409,7 @@ chrome.storage.onChanged.addListener((changes) => {
   for (const [key, { newValue }] of Object.entries(changes)) {
     if (key === 'fontFamily' || key === 'fontSize') {
       // Update any simplified text elements with new styles
-      const simplifiedElements = document.querySelectorAll('.dyslexia-simplified-text');
+      const simplifiedElements = document.querySelectorAll('.readable-simplified-text');
       if (simplifiedElements.length > 0) {
         simplifiedElements.forEach(element => {
           if (key === 'fontFamily') element.style.fontFamily = newValue;

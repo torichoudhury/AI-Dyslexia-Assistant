@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { BookOpen, Volume2, Palette, Settings, RefreshCw, Moon, Sun } from 'lucide-react';
+import { BookOpen, Volume2, Palette, Settings, RefreshCw, Moon, Sun, RotateCcw } from 'lucide-react';
 
 function App() {
   const [text, setText] = useState('');
@@ -19,6 +19,48 @@ function App() {
   const [speechVoice, setSpeechVoice] = useState('default');
   const [backendStatus, setBackendStatus] = useState('unknown');
   const [errorMessage, setErrorMessage] = useState('');
+
+  // Default settings
+  const DEFAULT_SETTINGS = {
+    fontSize: 16,
+    fontFamily: 'OpenDyslexic',
+    lineSpacing: 1.5,
+    theme: 'light',
+    backgroundColor: '#f8f9fa',
+    textColor: '#212529',
+    autoSimplify: false,
+    autoReadAloud: false,
+    showSimplifyButton: true,
+    speechRate: 0.9,
+    speechVoice: 'default'
+  };
+
+  // Reset all settings to default
+  const resetSettings = () => {
+    setFontSize(DEFAULT_SETTINGS.fontSize);
+    setFontFamily(DEFAULT_SETTINGS.fontFamily);
+    setLineSpacing(DEFAULT_SETTINGS.lineSpacing);
+    setTheme(DEFAULT_SETTINGS.theme);
+    setBackgroundColor(DEFAULT_SETTINGS.backgroundColor);
+    setTextColor(DEFAULT_SETTINGS.textColor);
+    setAutoSimplify(DEFAULT_SETTINGS.autoSimplify);
+    setAutoReadAloud(DEFAULT_SETTINGS.autoReadAloud);
+    setShowSimplifyButton(DEFAULT_SETTINGS.showSimplifyButton);
+    setSpeechRate(DEFAULT_SETTINGS.speechRate);
+    setSpeechVoice(DEFAULT_SETTINGS.speechVoice);
+    
+    // Reset text and simplified text
+    setText('');
+    setSimplifiedText('');
+
+    // Sync with Chrome storage
+    if (chrome?.storage?.sync) {
+      chrome.storage.sync.set(DEFAULT_SETTINGS);
+    }
+
+    // Save to localStorage
+    localStorage.setItem('dyslexiaAssistantSettings', JSON.stringify(DEFAULT_SETTINGS));
+  };
 
   // Apply theme settings
   useEffect(() => {
@@ -221,12 +263,19 @@ function App() {
       <header className="p-4 border-b flex justify-between items-center">
         <div className="flex items-center space-x-2">
           <BookOpen className="h-6 w-6" />
-          <h1 className="text-xl font-bold">Dyslexia Assistant</h1>
+          <h1 className="text-xl font-bold">ReadAble</h1>
         </div>
         <div className="flex items-center space-x-2">
           {backendStatus === 'offline' && (
             <span className="text-xs px-2 py-1 bg-red-100 text-red-800 rounded-full">Backend offline</span>
           )}
+          <button 
+            onClick={resetSettings}
+            className="p-2 rounded-full hover:bg-gray-200 dark:hover:bg-gray-700"
+            title="Reset all settings"
+          >
+            <RotateCcw className="h-5 w-5" />
+          </button>
           <button 
             onClick={toggleTheme}
             className="p-2 rounded-full hover:bg-gray-200 dark:hover:bg-gray-700"
@@ -469,7 +518,7 @@ function App() {
               <h3 className="font-medium mb-2">Preview</h3>
               <p>
                 This is a preview of how your text will appear with the current settings.
-                Dyslexia Assistant helps make reading easier by simplifying text and
+                ReadAble helps make reading easier by simplifying text and
                 providing customizable display options.
               </p>
             </div>
@@ -573,7 +622,7 @@ function App() {
             <div>
               <h2 className="text-lg font-medium mb-4">About</h2>
               <p>
-                AI Dyslexia Assistant v0.1.0
+                ReadAble v0.1.0
               </p>
               <p className="mt-2">
                 This extension uses AI to simplify text and make reading easier for people with dyslexia.
@@ -596,7 +645,7 @@ function App() {
 
       {/* Footer */}
       <footer className="p-3 text-center text-sm border-t">
-        AI Dyslexia Assistant &copy; 2025
+        ReadAble &copy; 2025
       </footer>
     </div>
   );

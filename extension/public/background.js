@@ -17,6 +17,12 @@ chrome.runtime.onInstalled.addListener(() => {
     title: 'Toggle dark mode',
     contexts: ['page']
   });
+
+  chrome.contextMenus.create({
+    id: 'resetPage',
+    title: 'Reset page to default',
+    contexts: ['page']
+  });
   
   // Initialize default settings
   chrome.storage.sync.get(['theme', 'backgroundColor', 'textColor', 'fontFamily', 'fontSize', 'lineSpacing'], (result) => {
@@ -64,6 +70,19 @@ chrome.contextMenus.onClicked.addListener((info, tab) => {
           textColor: newTextColor
         }
       });
+    });
+  } else if (info.menuItemId === 'resetPage') {
+    chrome.tabs.sendMessage(tab.id, { action: 'resetPage' });
+    // Reset storage to defaults
+    chrome.storage.sync.set({
+      theme: 'light',
+      backgroundColor: '#f8f9fa',
+      textColor: '#212529',
+      fontFamily: 'OpenDyslexic',
+      fontSize: 16,
+      lineSpacing: 1.5,
+      autoSimplify: false,
+      showSimplifyButton: true
     });
   }
 });
