@@ -1,12 +1,17 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import google.generativeai as genai
+from dotenv import load_dotenv
+import os
 
 app = Flask(__name__)
 CORS(app)  # Allow frontend to call the backend
 
+load_dotenv()  # Load environment variables
+api_key = os.getenv('GEMINI_API_KEY')
+
 # Set up Gemini API key
-genai.configure(api_key="AIzaSyDdSUEBjD5VeIWSsS72iTJPPkBarihyS6w")
+genai.configure(api_key=api_key)
 
 @app.route('/simplify', methods=['POST'])
 def simplify_text():
