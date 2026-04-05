@@ -1,6 +1,5 @@
 Flask
 flask-cors
 google-generativeai
-lucide-react
-react
-react-dom
+python-dotenv
+pymongo

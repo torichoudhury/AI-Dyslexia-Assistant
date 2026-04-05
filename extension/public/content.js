@@ -12,6 +12,20 @@ const DEFAULT_SETTINGS = {
   showSimplifyButton: true
 };
 
+function getOrCreateUserId() {
+  return new Promise((resolve) => {
+    chrome.storage.sync.get(['userId'], (result) => {
+      if (result.userId) {
+        resolve(result.userId);
+        return;
+      }
+
+      const generatedId = `user-${Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
+      chrome.storage.sync.set({ userId: generatedId }, () => resolve(generatedId));
+    });
+  });
+}
+
 // Create a floating button for text selection
 function createFloatingButton() {
   const button = document.createElement('button');
@@ -84,13 +98,20 @@ async function simplifySelectedText() {
   if (!text) return;
   
   try {
+    const userId = await getOrCreateUserId();
+
     // Send text to backend for simplification
     const response = await fetch('http://localhost:5000/simplify', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({ text }),
+      body: JSON.stringify({
+        text,
+        user_id: userId,
+        source_url: window.location.href,
+        request_source: 'content-script-selection'
+      }),
     });
     
     const data = await response.json();
@@ -261,6 +282,7 @@ function findMainContent() {
 // Simplify all text on the page
 async function simplifyComplexWordsOnPage() {
   const mainContent = findMainContent();
+  const userId = await getOrCreateUserId();
   
   // Get all text-containing elements within the main content
   const textElements = mainContent.querySelectorAll(
@@ -288,7 +310,12 @@ async function simplifyComplexWordsOnPage() {
         headers: {
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({ text: element.textContent }),
+        body: JSON.stringify({
+          text: element.textContent,
+          user_id: userId,
+          source_url: window.location.href,
+          request_source: 'content-script-page'
+        }),
       });
 
       const data = await response.json();
