@@ -1,5 +1,15 @@
-import React, { useEffect, useRef, useState } from 'react';
-import { BookOpen, Moon, Palette, RefreshCw, RotateCcw, Settings, Sun, Volume2 } from 'lucide-react';
+import { useEffect, useRef, useState } from 'react';
+import { BookOpen, KeyRound, LogIn, LogOut, Moon, Palette, RefreshCw, RotateCcw, Settings, ShieldCheck, Sun, UserPlus, Volume2 } from 'lucide-react';
+
+declare const chrome:
+  | {
+      storage?: {
+        sync?: {
+          set: (items: Record<string, unknown>) => void;
+        };
+      };
+    }
+  | undefined;
 
 type TabName = 'simplify' | 'history' | 'glossary' | 'appearance' | 'settings';
 
@@ -39,6 +49,7 @@ interface AppUser {
   id: string;
   user_id: string;
   display_name: string;
+  auth_required?: boolean;
   created_at?: string;
   updated_at?: string;
 }
@@ -61,19 +72,11 @@ const DEFAULT_SETTINGS: UserPreferences = {
 
 const SETTINGS_STORAGE_KEY = 'dyslexiaAssistantSettings';
 const USER_ID_STORAGE_KEY = 'readableUserId';
+const AUTH_TOKENS_STORAGE_KEY = 'readableAuthTokens';
+const ACTIVE_AUTH_TOKEN_STORAGE_KEY = 'authToken';
 
-function getOrCreateUserId(): string {
-  const existing = localStorage.getItem(USER_ID_STORAGE_KEY);
-  if (existing) {
-    return existing;
-  }
-
-  const generated = typeof crypto !== 'undefined' && crypto.randomUUID
-    ? crypto.randomUUID()
-    : `user-${Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
-
-  localStorage.setItem(USER_ID_STORAGE_KEY, generated);
-  return generated;
+function getStoredUserId(): string {
+  return localStorage.getItem(USER_ID_STORAGE_KEY) || '';
 }
 
 function App() {
@@ -113,11 +116,20 @@ function App() {
   const [users, setUsers] = useState<AppUser[]>([]);
   const [isUsersLoading, setIsUsersLoading] = useState(false);
   const [newUserName, setNewUserName] = useState('');
+  const [newUserPassword, setNewUserPassword] = useState('');
+  const [newUserPasswordConfirm, setNewUserPasswordConfirm] = useState('');
   const [usersMessage, setUsersMessage] = useState('');
+  const [profilePassword, setProfilePassword] = useState('');
+  const [authTokens, setAuthTokens] = useState<Record<string, string>>({});
+  const [isAuthLoading, setIsAuthLoading] = useState(false);
 
   const [isSettingsHydrated, setIsSettingsHydrated] = useState(false);
   const [isRemoteReady, setIsRemoteReady] = useState(false);
   const preferencesSyncTimer = useRef<number | undefined>(undefined);
+  const activeUser = users.find((item) => item.user_id === userId);
+  const activeAuthToken = userId ? authTokens[userId] || '' : '';
+  const isProfileLocked = Boolean(activeUser?.auth_required && !activeAuthToken);
+  const canUseProfileData = Boolean(activeUser && !isProfileLocked);
 
   const applyPreferences = (preferences: Partial<UserPreferences>) => {
     if (typeof preferences.fontSize === 'number') setFontSize(preferences.fontSize);
@@ -149,9 +161,138 @@ function App() {
   const setActiveUser = (nextUserId: string) => {
     setUserId(nextUserId);
     localStorage.setItem(USER_ID_STORAGE_KEY, nextUserId);
+    const nextAuthToken = authTokens[nextUserId] || '';
 
     if (chrome?.storage?.sync) {
-      chrome.storage.sync.set({ userId: nextUserId });
+      chrome.storage.sync.set({
+        userId: nextUserId,
+        [ACTIVE_AUTH_TOKEN_STORAGE_KEY]: nextAuthToken
+      });
+    }
+  };
+
+  const clearTokenForUser = (targetUserId: string) => {
+    setAuthTokens((currentTokens) => {
+      if (!currentTokens[targetUserId]) {
+        return currentTokens;
+      }
+
+      const nextTokens = { ...currentTokens };
+      delete nextTokens[targetUserId];
+      return nextTokens;
+    });
+  };
+
+  const clearTokenForUserIfMatching = (targetUserId: string, tokenUsed: string) => {
+    if (!tokenUsed) {
+      return;
+    }
+
+    setAuthTokens((currentTokens) => {
+      if (currentTokens[targetUserId] !== tokenUsed) {
+        return currentTokens;
+      }
+
+      const nextTokens = { ...currentTokens };
+      delete nextTokens[targetUserId];
+      return nextTokens;
+    });
+  };
+
+  const getAuthHeaders = (targetUserId: string): Record<string, string> => {
+    const token = authTokens[targetUserId];
+    if (!token) {
+      return {};
+    }
+
+    return {
+      'X-User-Token': token
+    };
+  };
+
+  const unlockActiveProfile = async () => {
+    if (!activeUser) {
+      setUsersMessage('Select a profile first.');
+      return;
+    }
+
+    if (!profilePassword.trim()) {
+      setUsersMessage('Enter the profile password to unlock this profile.');
+      return;
+    }
+
+    setIsAuthLoading(true);
+    try {
+      const response = await fetch(`${API_BASE_URL}/auth/login`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          user_id: activeUser.user_id,
+          password: profilePassword.trim()
+        })
+      });
+
+      const data = await response.json();
+      if (!response.ok || typeof data.auth_token !== 'string') {
+        const authError = typeof data.error === 'string' ? data.error : 'Could not unlock profile.';
+        setUsersMessage(authError);
+        return;
+      }
+
+      const authToken = data.auth_token as string;
+      const nextTokens = {
+        ...authTokens,
+        [activeUser.user_id]: authToken
+      };
+      setAuthTokens(nextTokens);
+      localStorage.setItem(AUTH_TOKENS_STORAGE_KEY, JSON.stringify(nextTokens));
+
+      if (chrome?.storage?.sync) {
+        chrome.storage.sync.set({
+          userId: activeUser.user_id,
+          authTokens: nextTokens,
+          [ACTIVE_AUTH_TOKEN_STORAGE_KEY]: authToken
+        });
+      }
+
+      setProfilePassword('');
+      setUsersMessage('Profile unlocked.');
+      void fetchHistory(activeUser.user_id, authToken);
+      void fetchGlossary(activeUser.user_id, glossarySearch, authToken);
+    } catch (error) {
+      console.error('Profile unlock failed:', error);
+      setUsersMessage('Could not connect to backend while unlocking profile.');
+    } finally {
+      setIsAuthLoading(false);
+    }
+  };
+
+  const lockActiveProfile = async () => {
+    if (!activeUser) {
+      return;
+    }
+
+    try {
+      const token = authTokens[activeUser.user_id];
+      if (token) {
+        await fetch(`${API_BASE_URL}/auth/logout`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-User-Token': token
+          },
+          body: JSON.stringify({ user_id: activeUser.user_id })
+        });
+      }
+    } catch (error) {
+      console.error('Profile lock failed:', error);
+    } finally {
+      clearTokenForUser(activeUser.user_id);
+      setHistoryItems([]);
+      setGlossaryItems([]);
+      setUsersMessage('Profile locked.');
     }
   };
 
@@ -178,30 +319,33 @@ function App() {
     return [];
   };
 
-  const ensureUserExists = async (targetUserId: string, displayName = '') => {
-    if (!targetUserId || backendStatus !== 'online') {
-      return;
-    }
-
-    try {
-      await fetch(`${API_BASE_URL}/users`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
-          user_id: targetUserId,
-          display_name: displayName
-        })
-      });
-    } catch (error) {
-      console.error('Failed to ensure user exists:', error);
-    }
-  };
-
   const createUserProfile = async () => {
     if (backendStatus !== 'online') {
       setUsersMessage('Backend must be online to create a user profile.');
+      return;
+    }
+
+    const trimmedName = newUserName.trim();
+    const trimmedPassword = newUserPassword.trim();
+    const trimmedConfirm = newUserPasswordConfirm.trim();
+
+    if (!trimmedName) {
+      setUsersMessage('Display name is required.');
+      return;
+    }
+
+    if (!trimmedPassword) {
+      setUsersMessage('Password is required for every new profile.');
+      return;
+    }
+
+    if (trimmedPassword.length < 8) {
+      setUsersMessage('Password must be at least 8 characters long.');
+      return;
+    }
+
+    if (trimmedPassword !== trimmedConfirm) {
+      setUsersMessage('Password and confirmation do not match.');
       return;
     }
 
@@ -212,19 +356,42 @@ function App() {
           'Content-Type': 'application/json'
         },
         body: JSON.stringify({
-          display_name: newUserName.trim()
+          display_name: trimmedName,
+          password: trimmedPassword
         })
       });
 
       const data = await response.json();
       if (!response.ok || !data.user?.user_id) {
-        setUsersMessage('Could not create a new user profile.');
+        const createError = typeof data.error === 'string' ? data.error : 'Could not create a new secure profile.';
+        setUsersMessage(createError);
         return;
       }
 
       const createdUser = data.user as AppUser;
       setUsersMessage(`Created user profile: ${createdUser.display_name}`);
       setNewUserName('');
+      setNewUserPassword('');
+      setNewUserPasswordConfirm('');
+
+      if (typeof data.auth_token === 'string') {
+        const authToken = data.auth_token as string;
+        const nextTokens = {
+          ...authTokens,
+          [createdUser.user_id]: authToken
+        };
+        setAuthTokens(nextTokens);
+        localStorage.setItem(AUTH_TOKENS_STORAGE_KEY, JSON.stringify(nextTokens));
+
+        if (chrome?.storage?.sync) {
+          chrome.storage.sync.set({
+            userId: createdUser.user_id,
+            authTokens: nextTokens,
+            [ACTIVE_AUTH_TOKEN_STORAGE_KEY]: authToken
+          });
+        }
+      }
+
       await fetchUsers();
       setActiveUser(createdUser.user_id);
       setSimplifiedText('');
@@ -236,15 +403,31 @@ function App() {
     }
   };
 
-  const fetchHistory = async (requestedUserId: string) => {
+  const fetchHistory = async (requestedUserId: string, authTokenOverride?: string) => {
     if (!requestedUserId || backendStatus !== 'online') {
       return;
     }
 
     setIsHistoryLoading(true);
     try {
-      const response = await fetch(`${API_BASE_URL}/history/${encodeURIComponent(requestedUserId)}?limit=50`);
+      const tokenUsed = authTokenOverride ?? authTokens[requestedUserId] ?? '';
+      const response = await fetch(`${API_BASE_URL}/history/${encodeURIComponent(requestedUserId)}?limit=50`, {
+        headers: tokenUsed ? { 'X-User-Token': tokenUsed } : {}
+      });
       const data = await response.json();
+      if (response.status === 404) {
+        setHistoryItems([]);
+        setUsersMessage(typeof data.error === 'string' ? data.error : 'Profile not found.');
+        return;
+      }
+
+      if (response.status === 401) {
+        clearTokenForUserIfMatching(requestedUserId, tokenUsed);
+        setHistoryItems([]);
+        setUsersMessage(typeof data.error === 'string' ? data.error : 'This profile is locked. Unlock it in settings.');
+        return;
+      }
+
       if (response.ok && Array.isArray(data.history)) {
         setHistoryItems(data.history as HistoryItem[]);
       }
@@ -255,16 +438,32 @@ function App() {
     }
   };
 
-  const fetchGlossary = async (requestedUserId: string, query = '') => {
+  const fetchGlossary = async (requestedUserId: string, query = '', authTokenOverride?: string) => {
     if (!requestedUserId || backendStatus !== 'online') {
       return;
     }
 
     setIsGlossaryLoading(true);
     try {
+      const tokenUsed = authTokenOverride ?? authTokens[requestedUserId] ?? '';
       const endpoint = `${API_BASE_URL}/glossary/${encodeURIComponent(requestedUserId)}?q=${encodeURIComponent(query)}`;
-      const response = await fetch(endpoint);
+      const response = await fetch(endpoint, {
+        headers: tokenUsed ? { 'X-User-Token': tokenUsed } : {}
+      });
       const data = await response.json();
+      if (response.status === 404) {
+        setGlossaryItems([]);
+        setGlossaryMessage(typeof data.error === 'string' ? data.error : 'Profile not found.');
+        return;
+      }
+
+      if (response.status === 401) {
+        clearTokenForUserIfMatching(requestedUserId, tokenUsed);
+        setGlossaryItems([]);
+        setGlossaryMessage(typeof data.error === 'string' ? data.error : 'This profile is locked. Unlock it in settings.');
+        return;
+      }
+
       if (response.ok && Array.isArray(data.glossary)) {
         setGlossaryItems(data.glossary as GlossaryItem[]);
       }
@@ -283,7 +482,8 @@ function App() {
     await fetch(`${API_BASE_URL}/preferences/${encodeURIComponent(requestedUserId)}`, {
       method: 'PUT',
       headers: {
-        'Content-Type': 'application/json'
+        'Content-Type': 'application/json',
+        ...getAuthHeaders(requestedUserId)
       },
       body: JSON.stringify({ preferences })
     });
@@ -339,10 +539,12 @@ function App() {
     setIsLoading(true);
     setErrorMessage('');
     try {
+      const tokenUsed = authTokens[userId] ?? '';
       const response = await fetch(`${API_BASE_URL}/simplify`, {
         method: 'POST',
         headers: {
-          'Content-Type': 'application/json'
+          'Content-Type': 'application/json',
+          ...(tokenUsed ? { 'X-User-Token': tokenUsed } : {})
         },
         body: JSON.stringify({
           text,
@@ -353,6 +555,15 @@ function App() {
       });
 
       const data = await response.json();
+      if (response.status === 401) {
+        clearTokenForUserIfMatching(userId, tokenUsed);
+        const authError = typeof data.error === 'string' ? data.error : 'This profile is locked. Unlock it in settings.';
+        setUsersMessage(authError);
+        setErrorMessage(authError);
+        setSimplifiedText('');
+        return;
+      }
+
       if (response.ok && typeof data.simplified_text === 'string') {
         setSimplifiedText(data.simplified_text);
         void fetchHistory(userId);
@@ -430,10 +641,12 @@ function App() {
     }
 
     try {
+      const tokenUsed = authTokens[userId] ?? '';
       const response = await fetch(`${API_BASE_URL}/glossary`, {
         method: 'POST',
         headers: {
-          'Content-Type': 'application/json'
+          'Content-Type': 'application/json',
+          ...(tokenUsed ? { 'X-User-Token': tokenUsed } : {})
         },
         body: JSON.stringify({
           user_id: userId,
@@ -444,6 +657,12 @@ function App() {
       });
 
       const data = await response.json();
+      if (response.status === 401) {
+        clearTokenForUserIfMatching(userId, tokenUsed);
+        setGlossaryMessage(typeof data.error === 'string' ? data.error : 'This profile is locked. Unlock it in settings.');
+        return;
+      }
+
       if (!response.ok) {
         setGlossaryMessage(typeof data.error === 'string' ? data.error : 'Could not save glossary entry.');
         return;
@@ -461,8 +680,22 @@ function App() {
 
   const removeGlossaryEntry = async (itemId: string) => {
     try {
+      const tokenUsed = authTokens[userId] ?? '';
       const endpoint = `${API_BASE_URL}/glossary/${encodeURIComponent(itemId)}?user_id=${encodeURIComponent(userId)}`;
-      const response = await fetch(endpoint, { method: 'DELETE' });
+      const response = await fetch(endpoint, {
+        method: 'DELETE',
+        headers: {
+          ...(tokenUsed ? { 'X-User-Token': tokenUsed } : {})
+        }
+      });
+
+      if (response.status === 401) {
+        const data = await response.json();
+        clearTokenForUserIfMatching(userId, tokenUsed);
+        setGlossaryMessage(typeof data.error === 'string' ? data.error : 'This profile is locked. Unlock it in settings.');
+        return;
+      }
+
       if (response.ok) {
         void fetchGlossary(userId, glossarySearch);
         setGlossaryMessage('Glossary entry deleted.');
@@ -482,8 +715,10 @@ function App() {
   }, [fontSize, fontFamily, lineSpacing, backgroundColor, textColor]);
 
   useEffect(() => {
-    const localUserId = getOrCreateUserId();
-    setActiveUser(localUserId);
+    const localUserId = getStoredUserId();
+    if (localUserId) {
+      setActiveUser(localUserId);
+    }
 
     const savedSettingsRaw = localStorage.getItem(SETTINGS_STORAGE_KEY);
     if (savedSettingsRaw) {
@@ -495,8 +730,35 @@ function App() {
       }
     }
 
+    const savedTokensRaw = localStorage.getItem(AUTH_TOKENS_STORAGE_KEY);
+    if (savedTokensRaw) {
+      try {
+        const parsedTokens = JSON.parse(savedTokensRaw) as Record<string, string>;
+        if (parsedTokens && typeof parsedTokens === 'object') {
+          setAuthTokens(parsedTokens);
+        }
+      } catch (error) {
+        console.error('Failed to parse auth tokens:', error);
+      }
+    }
+
     setIsSettingsHydrated(true);
   }, []);
+
+  useEffect(() => {
+    if (!isSettingsHydrated) {
+      return;
+    }
+
+    localStorage.setItem(AUTH_TOKENS_STORAGE_KEY, JSON.stringify(authTokens));
+
+    if (chrome?.storage?.sync) {
+      chrome.storage.sync.set({
+        authTokens,
+        [ACTIVE_AUTH_TOKEN_STORAGE_KEY]: userId ? authTokens[userId] || '' : ''
+      });
+    }
+  }, [isSettingsHydrated, authTokens, userId]);
 
   useEffect(() => {
     void checkBackendStatus();
@@ -508,6 +770,25 @@ function App() {
       window.clearInterval(interval);
     };
   }, []);
+
+  useEffect(() => {
+    if (backendStatus !== 'online') {
+      return;
+    }
+
+    void fetchUsers();
+  }, [backendStatus]);
+
+  useEffect(() => {
+    if (users.length === 0) {
+      return;
+    }
+
+    const hasSelectedUser = users.some((item) => item.user_id === userId);
+    if (!hasSelectedUser) {
+      setActiveUser(users[0].user_id);
+    }
+  }, [users, userId]);
 
   useEffect(() => {
     if (!isSettingsHydrated) {
@@ -562,15 +843,22 @@ function App() {
 
     const bootstrapRemote = async () => {
       try {
-        await ensureUserExists(userId);
-        const existingUsers = await fetchUsers();
-        if (!isCancelled && existingUsers.length === 0) {
-          await ensureUserExists(userId, 'My Profile');
-          await fetchUsers();
+        const tokenUsed = authTokens[userId] ?? '';
+        const response = await fetch(`${API_BASE_URL}/preferences/${encodeURIComponent(userId)}`, {
+          headers: tokenUsed ? { 'X-User-Token': tokenUsed } : {}
+        });
+        const data = await response.json();
+        if (!isCancelled && response.status === 404) {
+          setUsersMessage('Selected profile was not found. Pick another profile or create a new one.');
+          return;
         }
 
-        const response = await fetch(`${API_BASE_URL}/preferences/${encodeURIComponent(userId)}`);
-        const data = await response.json();
+        if (!isCancelled && response.status === 401) {
+          clearTokenForUserIfMatching(userId, tokenUsed);
+          setUsersMessage(typeof data.error === 'string' ? data.error : 'This profile is locked. Unlock it in settings.');
+          return;
+        }
+
         if (!isCancelled && response.ok && data.preferences) {
           applyPreferences(data.preferences as Partial<UserPreferences>);
         }
@@ -590,10 +878,14 @@ function App() {
     return () => {
       isCancelled = true;
     };
-  }, [userId, backendStatus]);
+  }, [userId, backendStatus, activeAuthToken]);
 
   useEffect(() => {
     if (!isSettingsHydrated || !isRemoteReady || !userId || backendStatus !== 'online') {
+      return;
+    }
+
+    if (activeUser?.auth_required && !activeAuthToken) {
       return;
     }
 
@@ -637,7 +929,9 @@ function App() {
     autoReadAloud,
     showSimplifyButton,
     speechRate,
-    speechVoice
+    speechVoice,
+    activeUser?.auth_required,
+    activeAuthToken
   ]);
 
   useEffect(() => {
@@ -658,8 +952,6 @@ function App() {
     backgroundColor: theme === 'light' ? 'white' : '#2a2a2a',
     color: 'var(--text-color)'
   };
-
-  const activeUser = users.find((item) => item.user_id === userId);
 
   return (
     <div
@@ -737,9 +1029,9 @@ function App() {
             <div className="flex flex-wrap gap-2">
               <button
                 onClick={simplifyText}
-                disabled={isLoading || !text.trim() || backendStatus !== 'online'}
+                disabled={isLoading || !text.trim() || backendStatus !== 'online' || !canUseProfileData}
                 className={`px-4 py-2 rounded-lg bg-blue-600 text-white flex items-center gap-2 ${
-                  isLoading || !text.trim() || backendStatus !== 'online' ? 'opacity-50 cursor-not-allowed' : 'hover:bg-blue-700'
+                  isLoading || !text.trim() || backendStatus !== 'online' || !canUseProfileData ? 'opacity-50 cursor-not-allowed' : 'hover:bg-blue-700'
                 }`}
               >
                 {isLoading ? <RefreshCw className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
@@ -763,14 +1055,28 @@ function App() {
 
               <button
                 onClick={useCurrentSimplificationForGlossary}
-                disabled={!text.trim() || !simplifiedText.trim()}
+                disabled={!text.trim() || !simplifiedText.trim() || !canUseProfileData}
                 className={`px-4 py-2 rounded-lg bg-indigo-600 text-white ${
-                  !text.trim() || !simplifiedText.trim() ? 'opacity-50 cursor-not-allowed' : 'hover:bg-indigo-700'
+                  !text.trim() || !simplifiedText.trim() || !canUseProfileData ? 'opacity-50 cursor-not-allowed' : 'hover:bg-indigo-700'
                 }`}
               >
                 Send to Glossary Draft
               </button>
             </div>
+
+            {!activeUser && (
+              <div className="p-3 bg-amber-100 text-amber-900 rounded-lg">
+                <p className="font-medium">Select a profile first.</p>
+                <p className="text-sm mt-1">Go to the More tab to sign in or create a secure profile.</p>
+              </div>
+            )}
+
+            {isProfileLocked && (
+              <div className="p-3 bg-amber-100 text-amber-900 rounded-lg">
+                <p className="font-medium">This profile is locked.</p>
+                <p className="text-sm mt-1">Go to the More tab and unlock the profile to simplify text and sync profile data.</p>
+              </div>
+            )}
 
             {errorMessage && <div className="p-3 bg-red-100 text-red-800 rounded-lg">{errorMessage}</div>}
 
@@ -804,7 +1110,7 @@ function App() {
               <button
                 onClick={() => void fetchHistory(userId)}
                 className="px-3 py-1 rounded bg-blue-600 text-white hover:bg-blue-700"
-                disabled={isHistoryLoading || backendStatus !== 'online'}
+                disabled={isHistoryLoading || backendStatus !== 'online' || !canUseProfileData}
               >
                 Refresh
               </button>
@@ -867,7 +1173,11 @@ function App() {
                 onChange={(event) => setGlossaryDefinition(event.target.value)}
                 placeholder="Simplified definition"
               ></textarea>
-              <button onClick={saveGlossaryEntry} className="px-4 py-2 rounded bg-blue-600 text-white hover:bg-blue-700">
+              <button
+                onClick={saveGlossaryEntry}
+                disabled={!canUseProfileData}
+                className={`px-4 py-2 rounded text-white ${!canUseProfileData ? 'bg-blue-300 cursor-not-allowed' : 'bg-blue-600 hover:bg-blue-700'}`}
+              >
                 Save Glossary Entry
               </button>
               {glossaryMessage && <p className="text-sm text-blue-700">{glossaryMessage}</p>}
@@ -999,10 +1309,23 @@ function App() {
 
         {activeTab === 'settings' && (
           <div className="space-y-6">
-            <div>
-              <h2 className="text-lg font-medium mb-4">User Profiles</h2>
+            <section className="rounded-2xl border border-slate-300/70 bg-gradient-to-br from-slate-50 to-white p-4 shadow-sm">
+              <div className="flex items-center justify-between gap-2 mb-4">
+                <h2 className="text-lg font-semibold inline-flex items-center gap-2 text-slate-800">
+                  <ShieldCheck className="h-5 w-5" />
+                  Sign In
+                </h2>
+                <button
+                  onClick={() => void fetchUsers()}
+                  className="px-3 py-1.5 rounded-lg bg-slate-700 text-white hover:bg-slate-800"
+                  disabled={backendStatus !== 'online' || isUsersLoading}
+                >
+                  Refresh
+                </button>
+              </div>
+
               <div className="space-y-3">
-                <label htmlFor="active-user" className="block">Active User</label>
+                <label htmlFor="active-user" className="block text-sm font-medium">Select Profile</label>
                 <select
                   id="active-user"
                   value={userId}
@@ -1014,6 +1337,7 @@ function App() {
 
                     setActiveUser(nextUserId);
                     setUsersMessage('');
+                    setProfilePassword('');
                     setHistoryItems([]);
                     setGlossaryItems([]);
                     setSimplifiedText('');
@@ -1022,55 +1346,142 @@ function App() {
                   style={inputCardStyle}
                   disabled={backendStatus !== 'online' || isUsersLoading}
                 >
-                  <option value="">Select a user</option>
+                  <option value="">Select a profile</option>
                   {users.map((item) => (
                     <option key={item.user_id} value={item.user_id}>
-                      {item.display_name} ({item.user_id})
+                      {item.display_name} ({item.user_id}){item.auth_required ? ' [password protected]' : ''}
                     </option>
                   ))}
                 </select>
 
-                <div className="flex gap-2">
-                  <button
-                    onClick={() => void fetchUsers()}
-                    className="px-3 py-2 rounded bg-blue-600 text-white hover:bg-blue-700"
-                    disabled={backendStatus !== 'online' || isUsersLoading}
-                  >
-                    Refresh Profiles
-                  </button>
-                </div>
-
-                <div className="pt-2">
-                  <label htmlFor="new-user-name" className="block mb-1">Create New User</label>
-                  <div className="flex gap-2">
-                    <input
-                      id="new-user-name"
-                      type="text"
-                      className="flex-1 p-2 border rounded-lg"
-                      style={inputCardStyle}
-                      value={newUserName}
-                      onChange={(event) => setNewUserName(event.target.value)}
-                      placeholder="Name, e.g. Alex"
-                    />
-                    <button
-                      onClick={() => void createUserProfile()}
-                      className="px-3 py-2 rounded bg-indigo-600 text-white hover:bg-indigo-700"
-                      disabled={backendStatus !== 'online'}
-                    >
-                      Create
-                    </button>
-                  </div>
-                </div>
+                {!activeUser && (
+                  <p className="text-sm text-slate-600">
+                    No active profile selected. Create a secure profile below, then sign in.
+                  </p>
+                )}
 
                 {activeUser && (
-                  <p className="text-sm opacity-80">
-                    Active profile: {activeUser.display_name} · Created {formatDate(activeUser.created_at)}
-                  </p>
+                  <div className="mt-3 rounded-xl border border-slate-300 p-3 space-y-3" style={inputCardStyle}>
+                    <div className="flex items-center justify-between gap-2">
+                      <div>
+                        <p className="font-semibold">{activeUser.display_name}</p>
+                        <p className="text-xs opacity-75">{activeUser.user_id}</p>
+                      </div>
+                      <span
+                        className={`text-xs px-2 py-1 rounded-full ${
+                          isProfileLocked
+                            ? 'bg-amber-100 text-amber-900'
+                            : activeUser.auth_required
+                              ? 'bg-emerald-100 text-emerald-900'
+                              : 'bg-slate-200 text-slate-700'
+                        }`}
+                      >
+                        {isProfileLocked
+                          ? 'Locked'
+                          : activeUser.auth_required
+                            ? 'Signed in'
+                            : 'Open profile'}
+                      </span>
+                    </div>
+
+                    {activeUser.auth_required && isProfileLocked && (
+                      <div className="space-y-2">
+                        <label htmlFor="profile-password" className="text-sm font-medium inline-flex items-center gap-2">
+                          <KeyRound className="h-4 w-4" />
+                          Password
+                        </label>
+                        <input
+                          id="profile-password"
+                          type="password"
+                          className="w-full p-2 border rounded-lg"
+                          value={profilePassword}
+                          onChange={(event) => setProfilePassword(event.target.value)}
+                          placeholder="Enter your password"
+                        />
+                        <button
+                          onClick={() => void unlockActiveProfile()}
+                          className="w-full px-3 py-2 rounded-lg bg-blue-700 text-white hover:bg-blue-800 inline-flex items-center justify-center gap-2"
+                          disabled={isAuthLoading}
+                        >
+                          <LogIn className="h-4 w-4" />
+                          {isAuthLoading ? 'Signing in...' : 'Sign In'}
+                        </button>
+                      </div>
+                    )}
+
+                    {activeUser.auth_required && !isProfileLocked && (
+                      <button
+                        onClick={() => void lockActiveProfile()}
+                        className="w-full px-3 py-2 rounded-lg bg-rose-700 text-white hover:bg-rose-800 inline-flex items-center justify-center gap-2"
+                      >
+                        <LogOut className="h-4 w-4" />
+                        Sign Out
+                      </button>
+                    )}
+
+                    {!activeUser.auth_required && (
+                      <p className="text-sm text-slate-700">
+                        This is a legacy profile without password protection. Create a secure profile below for full sign-in protection.
+                      </p>
+                    )}
+                  </div>
                 )}
 
                 {usersMessage && <p className="text-sm text-blue-700">{usersMessage}</p>}
               </div>
-            </div>
+            </section>
+
+            <section className="rounded-2xl border border-blue-200 bg-gradient-to-br from-blue-50 to-cyan-50 p-4 shadow-sm">
+              <h2 className="text-lg font-semibold inline-flex items-center gap-2 text-blue-900 mb-4">
+                <UserPlus className="h-5 w-5" />
+                Create Secure Profile
+              </h2>
+
+              <div className="space-y-3">
+                <input
+                  id="new-user-name"
+                  type="text"
+                  className="w-full p-2 border rounded-lg"
+                  style={inputCardStyle}
+                  value={newUserName}
+                  onChange={(event) => setNewUserName(event.target.value)}
+                  placeholder="Display name"
+                />
+
+                <input
+                  id="new-user-password"
+                  type="password"
+                  className="w-full p-2 border rounded-lg"
+                  style={inputCardStyle}
+                  value={newUserPassword}
+                  onChange={(event) => setNewUserPassword(event.target.value)}
+                  placeholder="Create password (minimum 8 characters)"
+                />
+
+                <input
+                  id="new-user-password-confirm"
+                  type="password"
+                  className="w-full p-2 border rounded-lg"
+                  style={inputCardStyle}
+                  value={newUserPasswordConfirm}
+                  onChange={(event) => setNewUserPasswordConfirm(event.target.value)}
+                  placeholder="Confirm password"
+                />
+
+                <button
+                  onClick={() => void createUserProfile()}
+                  className="w-full px-3 py-2 rounded-lg bg-blue-700 text-white hover:bg-blue-800 inline-flex items-center justify-center gap-2"
+                  disabled={backendStatus !== 'online' || isUsersLoading}
+                >
+                  <UserPlus className="h-4 w-4" />
+                  Create Profile
+                </button>
+
+                <p className="text-xs text-blue-900/80">
+                  Password creation is required for all new profiles.
+                </p>
+              </div>
+            </section>
 
             <div>
               <h2 className="text-lg font-medium mb-4">General Settings</h2>
@@ -1130,8 +1541,8 @@ function App() {
               <h2 className="text-lg font-medium mb-2">About</h2>
               <p>ReadAble v0.2.0</p>
               <p className="mt-2">MongoDB is now used for simplification history, user preferences, and personal glossary.</p>
-              <p className="mt-2 text-sm opacity-80">Current User ID: {userId || 'loading...'}</p>
-              <p className="mt-1 text-sm opacity-80">Current User Name: {activeUser?.display_name || 'loading...'}</p>
+              <p className="mt-2 text-sm opacity-80">Current User ID: {userId || 'none selected'}</p>
+              <p className="mt-1 text-sm opacity-80">Current User Name: {activeUser?.display_name || 'none selected'}</p>
             </div>
           </div>
         )}

@@ -26,6 +26,20 @@ function getOrCreateUserId() {
   });
 }
 
+function getAuthContext() {
+  return new Promise((resolve) => {
+    chrome.storage.sync.get(['userId', 'authToken', 'authTokens'], (result) => {
+      const userId = typeof result.userId === 'string' ? result.userId : '';
+      const authTokens = result.authTokens && typeof result.authTokens === 'object' ? result.authTokens : {};
+      const tokenFromMap = userId && typeof authTokens[userId] === 'string' ? authTokens[userId] : '';
+      const tokenFromActive = typeof result.authToken === 'string' ? result.authToken : '';
+      const authToken = tokenFromMap || tokenFromActive;
+
+      resolve({ userId, authToken });
+    });
+  });
+}
+
 // Create a floating button for text selection
 function createFloatingButton() {
   const button = document.createElement('button');
@@ -98,13 +112,18 @@ async function simplifySelectedText() {
   if (!text) return;
   
   try {
-    const userId = await getOrCreateUserId();
+    const { userId, authToken } = await getAuthContext();
+    if (!userId) {
+      alert('Select a profile in the extension before simplifying text on a page.');
+      return;
+    }
 
     // Send text to backend for simplification
     const response = await fetch('http://localhost:5000/simplify', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
+        ...(authToken ? { 'X-User-Token': authToken } : {})
       },
       body: JSON.stringify({
         text,
@@ -115,6 +134,11 @@ async function simplifySelectedText() {
     });
     
     const data = await response.json();
+
+    if (response.status === 401) {
+      alert(data.error || 'Authentication required. Open the extension and sign in to your profile.');
+      return;
+    }
     
     if (data.simplified_text) {
       // Replace the selected text with simplified text
@@ -282,7 +306,11 @@ function findMainContent() {
 // Simplify all text on the page
 async function simplifyComplexWordsOnPage() {
   const mainContent = findMainContent();
-  const userId = await getOrCreateUserId();
+  const { userId, authToken } = await getAuthContext();
+  if (!userId) {
+    alert('Select a profile in the extension before simplifying this page.');
+    return;
+  }
   
   // Get all text-containing elements within the main content
   const textElements = mainContent.querySelectorAll(
@@ -309,6 +337,7 @@ async function simplifyComplexWordsOnPage() {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
+          ...(authToken ? { 'X-User-Token': authToken } : {})
         },
         body: JSON.stringify({
           text: element.textContent,
@@ -319,6 +348,15 @@ async function simplifyComplexWordsOnPage() {
       });
 
       const data = await response.json();
+      if (response.status === 401) {
+        console.error('Authentication required for on-page simplify:', data.error || 'Sign in required');
+        if (simplifyButton) {
+          simplifyButton.textContent = 'Sign in required';
+          simplifyButton.disabled = false;
+        }
+        return;
+      }
+
       if (data.simplified_text) {
         const originalText = element.textContent;
         
@@ -366,9 +404,6 @@ async function simplifyComplexWordsOnPage() {
 
 // Initialize the extension
 function initializeExtension() {
-  // Create the simplify all button
-  createSimplifyAllButton();
-  
   // Apply global styles
   applyGlobalStyles();
   

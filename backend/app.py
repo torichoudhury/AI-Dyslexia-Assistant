@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import os
 import re
 import uuid
@@ -10,6 +10,7 @@ from flask import Flask, jsonify, request
 from flask_cors import CORS
 import google.generativeai as genai
 from pymongo import DESCENDING, MongoClient
+from werkzeug.security import check_password_hash, generate_password_hash
 
 app = Flask(__name__)
 CORS(app)  # Allow frontend to call the backend
@@ -29,11 +30,24 @@ users_collection = None
 preferences_collection = None
 history_collection = None
 glossary_collection = None
+sessions_collection = None
 mongo_error = None
+SESSION_DURATION_HOURS = 12
+PASSWORD_MIN_LENGTH = 8
 
 
 def utc_now():
     return datetime.now(timezone.utc)
+
+
+def normalize_utc_datetime(value):
+    if not isinstance(value, datetime):
+        return None
+
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+
+    return value.astimezone(timezone.utc)
 
 
 def to_iso(value):
@@ -58,6 +72,7 @@ def serialize_user(item):
         "id": str(item.get("_id")),
         "user_id": item.get("user_id", ""),
         "display_name": item.get("display_name", ""),
+        "auth_required": bool(item.get("password_hash")),
         "created_at": to_iso(item.get("created_at")),
         "updated_at": to_iso(item.get("updated_at")),
     }
@@ -99,8 +114,15 @@ def default_display_name(user_id):
     return f"Reader {suffix}"
 
 
-def ensure_user_exists(user_id, display_name=None):
+def ensure_user_exists(user_id, display_name=None, password=None, create_if_missing=True):
     if users_collection is None or not user_id:
+        return None
+
+    existing_user = users_collection.find_one({"user_id": user_id})
+    if existing_user is None and not create_if_missing:
+        return None
+
+    if existing_user is None and not (isinstance(password, str) and password.strip()):
         return None
 
     now = utc_now()
@@ -117,6 +139,9 @@ def ensure_user_exists(user_id, display_name=None):
     else:
         insert_payload["display_name"] = default_display_name(user_id)
 
+    if isinstance(password, str) and password.strip():
+        update_payload["password_hash"] = generate_password_hash(password.strip())
+
     users_collection.update_one(
         {"user_id": user_id},
         {
@@ -129,6 +154,83 @@ def ensure_user_exists(user_id, display_name=None):
     return users_collection.find_one({"user_id": user_id})
 
 
+def require_existing_user(user_id):
+    if users_collection is None or not user_id:
+        return None, (jsonify({"error": "Profile not found. Create a profile first."}), 404)
+
+    user = users_collection.find_one({"user_id": user_id})
+    if user is None:
+        return None, (jsonify({"error": "Profile not found. Create a profile first."}), 404)
+
+    return user, None
+
+
+def request_auth_token():
+    auth_header = (request.headers.get("Authorization") or "").strip()
+    if auth_header.lower().startswith("bearer "):
+        token = auth_header[7:].strip()
+        if token:
+            return token
+
+    return (request.headers.get("X-User-Token") or "").strip()
+
+
+def create_session(user_id):
+    if sessions_collection is None or not user_id:
+        return None
+
+    now = utc_now()
+    expires_at = now + timedelta(hours=SESSION_DURATION_HOURS)
+
+    for _ in range(3):
+        token = uuid.uuid4().hex
+        try:
+            sessions_collection.insert_one(
+                {
+                    "token": token,
+                    "user_id": user_id,
+                    "created_at": now,
+                    "expires_at": expires_at,
+                }
+            )
+            return {
+                "auth_token": token,
+                "expires_at": to_iso(expires_at),
+            }
+        except Exception:
+            continue
+
+    return None
+
+
+def require_profile_auth(user_id):
+    if users_collection is None or sessions_collection is None or not user_id:
+        return None
+
+    user = users_collection.find_one({"user_id": user_id})
+    if not user or not user.get("password_hash"):
+        return None
+
+    token = request_auth_token()
+    if not token:
+        return jsonify({"error": "Authentication required for this profile."}), 401
+
+    session = sessions_collection.find_one({"token": token, "user_id": user_id})
+    if not session:
+        return jsonify({"error": "Invalid or expired session token."}), 401
+
+    expires_at = normalize_utc_datetime(session.get("expires_at"))
+    if expires_at is None:
+        sessions_collection.delete_one({"_id": session.get("_id")})
+        return jsonify({"error": "Invalid session token metadata. Please sign in again."}), 401
+
+    if expires_at <= utc_now():
+        sessions_collection.delete_one({"_id": session.get("_id")})
+        return jsonify({"error": "Session expired. Please sign in again."}), 401
+
+    return None
+
+
 def bootstrap_mongodb():
     global mongo_client
     global mongo_db
@@ -136,6 +238,7 @@ def bootstrap_mongodb():
     global preferences_collection
     global history_collection
     global glossary_collection
+    global sessions_collection
     global mongo_error
 
     try:
@@ -147,6 +250,7 @@ def bootstrap_mongodb():
         preferences_collection = mongo_db["preferences"]
         history_collection = mongo_db["history"]
         glossary_collection = mongo_db["glossary"]
+        sessions_collection = mongo_db["sessions"]
 
         users_collection.create_index("user_id", unique=True)
         users_collection.create_index([("updated_at", DESCENDING)])
@@ -154,6 +258,8 @@ def bootstrap_mongodb():
         history_collection.create_index([("user_id", DESCENDING), ("created_at", DESCENDING)])
         glossary_collection.create_index([("user_id", DESCENDING), ("created_at", DESCENDING)])
         glossary_collection.create_index([("user_id", DESCENDING), ("term_key", DESCENDING)], unique=True)
+        sessions_collection.create_index("token", unique=True)
+        sessions_collection.create_index("expires_at", expireAfterSeconds=0)
 
     except Exception as exc:
         mongo_error = str(exc)
@@ -163,6 +269,7 @@ def bootstrap_mongodb():
         preferences_collection = None
         history_collection = None
         glossary_collection = None
+        sessions_collection = None
 
 
 def require_mongo():
@@ -198,10 +305,37 @@ def create_or_update_user():
     payload = request.get_json(silent=True) or {}
     requested_user_id = (payload.get("user_id") or "").strip()
     display_name = (payload.get("display_name") or "").strip()
+    password = (payload.get("password") or "").strip()
     user_id = requested_user_id or f"user-{uuid.uuid4().hex[:12]}"
 
-    user = ensure_user_exists(user_id, display_name)
-    return jsonify({"user": serialize_user(user)}), 201
+    existing_user = users_collection.find_one({"user_id": user_id})
+    if existing_user and password:
+        return jsonify({"error": "Use profile settings to change password for existing users."}), 400
+
+    if existing_user and display_name and existing_user.get("password_hash"):
+        auth_check = require_profile_auth(user_id)
+        if auth_check:
+            return auth_check
+
+    is_new_user = existing_user is None
+    if is_new_user and not password:
+        return jsonify({"error": "password is required when creating a profile."}), 400
+
+    if is_new_user and len(password) < PASSWORD_MIN_LENGTH:
+        return jsonify({"error": f"password must be at least {PASSWORD_MIN_LENGTH} characters."}), 400
+
+    user = ensure_user_exists(user_id, display_name, password if is_new_user else None, create_if_missing=True)
+    if user is None:
+        return jsonify({"error": "Could not create profile."}), 400
+
+    response_payload = {"user": serialize_user(user)}
+    if is_new_user:
+        session = create_session(user_id)
+        if session:
+            response_payload.update(session)
+
+    status_code = 201 if is_new_user else 200
+    return jsonify(response_payload), status_code
 
 
 @app.route("/users/<user_id>", methods=["PATCH"])
@@ -215,8 +349,71 @@ def rename_user(user_id):
     if not display_name:
         return jsonify({"error": "display_name is required."}), 400
 
-    user = ensure_user_exists(user_id, display_name)
+    _, user_error = require_existing_user(user_id)
+    if user_error:
+        return user_error
+
+    auth_check = require_profile_auth(user_id)
+    if auth_check:
+        return auth_check
+
+    user = ensure_user_exists(user_id, display_name, create_if_missing=False)
     return jsonify({"user": serialize_user(user)})
+
+
+@app.route("/auth/login", methods=["POST"])
+def login_profile():
+    mongo_check = require_mongo()
+    if mongo_check:
+        return mongo_check
+
+    payload = request.get_json(silent=True) or {}
+    user_id = (payload.get("user_id") or "").strip()
+    password = (payload.get("password") or "").strip()
+
+    if not user_id or not password:
+        return jsonify({"error": "user_id and password are required."}), 400
+
+    user = users_collection.find_one({"user_id": user_id})
+    if not user:
+        return jsonify({"error": "Profile not found."}), 404
+
+    password_hash = user.get("password_hash")
+    if not password_hash:
+        return jsonify({"error": "This profile does not have password authentication enabled."}), 400
+
+    if not check_password_hash(password_hash, password):
+        return jsonify({"error": "Invalid credentials."}), 401
+
+    session = create_session(user_id)
+    if not session:
+        return jsonify({"error": "Could not create authenticated session."}), 500
+
+    return jsonify({
+        "user": serialize_user(user),
+        **session,
+    })
+
+
+@app.route("/auth/logout", methods=["POST"])
+def logout_profile():
+    mongo_check = require_mongo()
+    if mongo_check:
+        return mongo_check
+
+    token = request_auth_token()
+    if not token:
+        return jsonify({"error": "Session token is required."}), 400
+
+    payload = request.get_json(silent=True) or {}
+    user_id = (payload.get("user_id") or "").strip()
+
+    query = {"token": token}
+    if user_id:
+        query["user_id"] = user_id
+
+    sessions_collection.delete_many(query)
+    return jsonify({"message": "Signed out."})
 
 
 @app.route("/simplify", methods=["POST"])
@@ -224,14 +421,23 @@ def simplify_text():
     try:
         data = request.get_json(silent=True) or {}
         text = (data.get("text") or "").strip()
-        user_id = (data.get("user_id") or "guest-user").strip()
+        user_id = (data.get("user_id") or "").strip()
         source_url = data.get("source_url") or ""
         request_source = data.get("request_source") or "unknown"
 
         if not text:
             return jsonify({"error": "Text is required."}), 400
 
-        ensure_user_exists(user_id)
+        if not user_id:
+            return jsonify({"error": "user_id is required."}), 400
+
+        _, user_error = require_existing_user(user_id)
+        if user_error:
+            return user_error
+
+        auth_check = require_profile_auth(user_id)
+        if auth_check:
+            return auth_check
 
         model = genai.GenerativeModel("gemini-2.5-flash")
 
@@ -279,6 +485,14 @@ def get_preferences(user_id):
     if mongo_check:
         return mongo_check
 
+    _, user_error = require_existing_user(user_id)
+    if user_error:
+        return user_error
+
+    auth_check = require_profile_auth(user_id)
+    if auth_check:
+        return auth_check
+
     item = preferences_collection.find_one({"user_id": user_id})
     return jsonify({"preferences": serialize_preferences(item)})
 
@@ -311,7 +525,13 @@ def update_preferences(user_id):
     sanitized = {key: preferences[key] for key in preferences if key in allowed_fields}
     sanitized["updated_at"] = utc_now()
 
-    ensure_user_exists(user_id)
+    _, user_error = require_existing_user(user_id)
+    if user_error:
+        return user_error
+
+    auth_check = require_profile_auth(user_id)
+    if auth_check:
+        return auth_check
 
     preferences_collection.update_one(
         {"user_id": user_id},
@@ -334,6 +554,14 @@ def get_history(user_id):
     if mongo_check:
         return mongo_check
 
+    _, user_error = require_existing_user(user_id)
+    if user_error:
+        return user_error
+
+    auth_check = require_profile_auth(user_id)
+    if auth_check:
+        return auth_check
+
     limit = request.args.get("limit", default=30, type=int)
     if limit is None or limit < 1:
         limit = 30
@@ -349,6 +577,14 @@ def get_glossary(user_id):
     mongo_check = require_mongo()
     if mongo_check:
         return mongo_check
+
+    _, user_error = require_existing_user(user_id)
+    if user_error:
+        return user_error
+
+    auth_check = require_profile_auth(user_id)
+    if auth_check:
+        return auth_check
 
     search_query = (request.args.get("q") or "").strip()
 
@@ -383,7 +619,13 @@ def upsert_glossary_item():
     term_key = term.lower()
     now = utc_now()
 
-    ensure_user_exists(user_id)
+    _, user_error = require_existing_user(user_id)
+    if user_error:
+        return user_error
+
+    auth_check = require_profile_auth(user_id)
+    if auth_check:
+        return auth_check
 
     glossary_collection.update_one(
         {"user_id": user_id, "term_key": term_key},
@@ -416,6 +658,14 @@ def delete_glossary_item(item_id):
     user_id = (request.args.get("user_id") or "").strip()
     if not user_id:
         return jsonify({"error": "user_id is required."}), 400
+
+    _, user_error = require_existing_user(user_id)
+    if user_error:
+        return user_error
+
+    auth_check = require_profile_auth(user_id)
+    if auth_check:
+        return auth_check
 
     try:
         object_id = ObjectId(item_id)
